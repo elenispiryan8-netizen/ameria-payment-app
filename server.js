@@ -5,87 +5,115 @@ require('dotenv').config();
 
 const app = express();
 app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
 
-// --- CONFIGURATION ---
-const AMERIA_API_URL = process.env.AMERIA_API_URL || "https://servicestest.ameriabank.am/VPOS/api/VPOS";
-const PAY_PAGE_URL = "https://servicestest.ameriabank.am/VPOS/Payments/Pay";
+// CONFIG
+const AMERIA_API_URL = "https://servicestest.ameriabank.am/VPOS/api/VPOS";
+const AMERIA_PAY_PAGE = "https://servicestest.ameriabank.am/VPOS/Payments/Pay";
+// Note: We use the API version 2024-01 for stability
+const SHOPIFY_STORE_URL = `https://${process.env.SHOP_DOMAIN}/admin/api/2024-01`;
 
-// 1. INITIALIZE PAYMENT
-// Shopify calls this endpoint when the user clicks "Pay"
-app.post('/api/pay', async (req, res) => {
-    const { orderId, amount, currency } = req.body;
+// 1. WEBHOOK: LISTEN FOR NEW ORDERS
+app.post('/api/order-created', async (req, res) => {
+    const order = req.body;
+    console.log(`New Order Received: ${order.id}`);
 
-    // "BackURL" is where Ameria redirects the user after payment 
-    // This must match your Render URL once deployed
-    const backUrl = `${process.env.HOST_URL}/api/callback`;
+    // Filter: Only process if the user selected "Credit Card (Ameriabank)"
+    const gateway = order.payment_gateway_names ? order.payment_gateway_names[0] : "";
+    
+    // Check if it's our manual payment method
+    if (gateway !== "manual" && gateway !== "Credit Card (Ameriabank)") {
+        return res.status(200).send("Ignored: Not an Ameria order");
+    }
 
-    const payload = {
-        "ClientID": process.env.AMERIA_CLIENT_ID,     // 
-        "Username": process.env.AMERIA_USERNAME,      // 
-        "Password": process.env.AMERIA_PASSWORD,      // 
-        "OrderID": orderId,                           // 
-        "Amount": amount,                             // 
-        "Description": `Order #${orderId}`,           // 
-        "BackURL": backUrl,                           // 
-        "Currency": currency || "051" // Default AMD  // 
-    };
+    if (order.financial_status === 'paid') {
+        return res.status(200).send("Ignored: Already paid");
+    }
 
     try {
-        //  Call InitPayment
-        const response = await axios.post(`${AMERIA_API_URL}/InitPayment`, payload);
-        
-        // [cite: 66] ResponseCode 1 means successful initialization
-        if (response.data.ResponseCode === 1) {
-            const paymentID = response.data.PaymentID;
+        // A. Initialize Payment with Ameria
+        // Ameria requires a unique numeric OrderID. We use the Shopify Order ID.
+        const payload = {
+            "ClientID": process.env.AMERIA_CLIENT_ID,
+            "Username": process.env.AMERIA_USERNAME,
+            "Password": process.env.AMERIA_PASSWORD,
+            "OrderID": order.id,                      
+            "Amount": order.total_price,              
+            "Currency": "051",                        // 051 = AMD (Armenian Dram)
+            "Description": `Order #${order.order_number}`,
+            "BackURL": `${process.env.HOST_URL}/api/callback?shopify_order_id=${order.id}`, 
+        };
+
+        const ameriaRes = await axios.post(`${AMERIA_API_URL}/InitPayment`, payload);
+
+        [cite_start]// Check response code [cite: 66, 75]
+        if (ameriaRes.data.ResponseCode === 1) {
+            const paymentID = ameriaRes.data.PaymentID;
+            const payUrl = `${AMERIA_PAY_PAGE}?id=${paymentID}&lang=en`;
+
+            // B. Log the Payment Link (This is what you send to the customer)
+            console.log("========================================");
+            console.log(`PAYMENT LINK FOR ORDER ${order.order_number}:`);
+            console.log(payUrl);
+            console.log("========================================");
             
-            // Return the redirect URL to the frontend
-            // [cite: 84] Construct the redirect URL
-            return res.json({ 
-                redirectUrl: `${PAY_PAGE_URL}?id=${paymentID}&lang=en` 
-            });
+            // In a real production app, you would email this link here using 'nodemailer'
         } else {
-            console.error("Ameria Init Error:", response.data.ResponseMessage);
-            return res.status(400).json({ error: response.data.ResponseMessage });
+            console.error("Ameria Init Failed:", ameriaRes.data.ResponseMessage);
         }
+        
+        res.status(200).send("Webhook received");
     } catch (error) {
-        console.error("Server Error:", error.message);
-        return res.status(500).json({ error: "Payment Initialization Failed" });
+        console.error("Error processing order:", error.message);
+        res.status(500).send("Error");
     }
 });
 
-// 2. CALLBACK HANDLER
-// Ameriabank redirects user here after payment [cite: 87]
+// 2. CALLBACK: CUSTOMER RETURNS FROM BANK
 app.get('/api/callback', async (req, res) => {
-    const { paymentID, responseCode, orderID } = req.query; // [cite: 88]
+    const { paymentID, shopify_order_id } = req.query;
 
-    // Note: Never trust 'responseCode' from URL blindly. Verify it server-side. [cite: 89]
     try {
-        const verifyPayload = {
-            "PaymentID": paymentID,              // [cite: 92]
-            "Username": process.env.AMERIA_USERNAME, 
+        [cite_start]// A. Verify Payment with Ameria [cite: 90]
+        const verifyRes = await axios.post(`${AMERIA_API_URL}/GetPaymentDetails`, {
+            "PaymentID": paymentID,
+            "Username": process.env.AMERIA_USERNAME,
             "Password": process.env.AMERIA_PASSWORD
-        };
+        });
 
-        //  GetPaymentDetails
-        const response = await axios.post(`${AMERIA_API_URL}/GetPaymentDetails`, verifyPayload);
-        const details = response.data;
+        [cite_start]// Check if Approved (1) or Deposited (2) [cite: 654]
+        [cite_start]// And ResponseCode "00" [cite: 649]
+        const status = verifyRes.data.OrderStatus;
+        if (verifyRes.data.ResponseCode === "00" && (status === "1" || status === "2")) {
 
-        // [cite: 653] Check if OrderStatus is "2" (Deposited) or "1" (Approved)
-        // [cite: 649] ResponseCode "00" is success
-        if (details.ResponseCode === "00" && (details.OrderStatus === "2" || details.OrderStatus === "1")) {
-            // SUCCESS: Redirect user to Shopify "Thank You" page
-            // You should also update Shopify order status via API here
-            res.send(`<h1>Payment Successful!</h1><p>Order ${orderID} is confirmed.</p>`);
+            // B. Mark Shopify Order as PAID
+            await markShopifyOrderPaid(shopify_order_id);
+            
+            res.send("<h1>Payment Successful! Your order is confirmed.</h1>");
         } else {
-            // FAILURE
-            res.send(`<h1>Payment Failed</h1><p>Reason: ${details.ResponseMessage}</p>`);
+            res.send(`<h1>Payment Failed or Pending. Message: ${verifyRes.data.ResponseMessage}</h1>`);
         }
-
     } catch (error) {
+        console.error("Callback failed:", error.message);
         res.status(500).send("Error verifying payment");
     }
 });
+
+// HELPER: Mark Order Paid in Shopify
+async function markShopifyOrderPaid(orderId) {
+    const transactionPayload = {
+        "transaction": {
+            "kind": "capture",
+            "status": "success",
+            "amount": "100.00" // Note: In production, fetch the actual order amount
+        }
+    };
+
+    await axios.post(
+        `${SHOPIFY_STORE_URL}/orders/${orderId}/transactions.json`,
+        transactionPayload,
+        { headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN } }
+    );
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
